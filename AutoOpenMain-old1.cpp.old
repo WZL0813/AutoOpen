@@ -1,0 +1,503 @@
+#include <windows.h>
+#include <tchar.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <strsafe.h>
+#include <commctrl.h>
+#include <shellapi.h>
+#include <shlwapi.h>
+
+#define SVCNAME _T("AutoOpenService")
+#define WINDOW_TITLE _T("AutoOpen-ByRyokuryuneko")
+#define CHECKBOX_TEXT _T("开机自启动")
+#define BUTTON_TEXT _T("应用设置")
+#define ID_CHECKBOX 1001
+#define ID_APPLY_BTN 1002
+
+SERVICE_STATUS          gSvcStatus;
+SERVICE_STATUS_HANDLE   gSvcStatusHandle;
+HANDLE                  ghSvcStopEvent = NULL;
+HICON                   hIcon = NULL;
+HWND                    hMainWnd = NULL;
+HWND                    hCheckbox = NULL;
+HWND                    hApplyBtn = NULL;
+
+// 函数声明
+VOID SvcInstall();
+VOID SvcUninstall();
+BOOL IsServiceInstalled(void);
+VOID WINAPI SvcCtrlHandler(DWORD);
+VOID WINAPI SvcMain(DWORD, LPTSTR *);
+VOID ReportSvcStatus(DWORD, DWORD, DWORD);
+VOID SvcInit(DWORD, LPTSTR *);
+BOOL InitApplication(HINSTANCE);
+LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
+BOOL InitApplication(HINSTANCE);
+BOOL InitInstance(HINSTANCE, int);
+void UpdateUIState();
+
+//
+// Purpose: 
+//   Entry point for the process
+//
+extern "C" int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int nCmdShow)
+{
+    // 调试输出
+    AllocConsole();
+    SetConsoleOutputCP(CP_UTF8);  // 设置控制台代码页为UTF-8
+    freopen("CONOUT$", "w", stdout);
+    freopen("CONOUT$", "w", stderr);
+    printf("程序启动\n");
+    fflush(stdout);  // 确保输出立即刷新
+    
+    // 添加控制台保持打开的机制
+    HWND hConsole = GetConsoleWindow();
+    if (hConsole) {
+        HMENU hMenu = GetSystemMenu(hConsole, FALSE);
+        if (hMenu) {
+            DeleteMenu(hMenu, SC_CLOSE, MF_BYCOMMAND);
+        }
+    }
+    UNREFERENCED_PARAMETER(hPrevInstance);
+    UNREFERENCED_PARAMETER(lpCmdLine);
+
+    // 检查是否以服务方式运行
+    if (lstrcmpi(lpCmdLine, _T("/service")) == 0)
+    {
+        SERVICE_TABLE_ENTRY DispatchTable[] = 
+        {
+            { const_cast<LPTSTR>(SVCNAME), (LPSERVICE_MAIN_FUNCTION)SvcMain },
+            { NULL, NULL }
+        };
+
+        if (!StartServiceCtrlDispatcher(DispatchTable))
+        {
+            ReportEvent(NULL, EVENTLOG_ERROR_TYPE, 0, 0, NULL, 1, 0, 
+                (LPCWSTR[]){_T("StartServiceCtrlDispatcher failed")}, NULL);
+        }
+        return 0;
+    }
+
+    // 初始化通用控件
+    INITCOMMONCONTROLSEX icex;
+    icex.dwSize = sizeof(INITCOMMONCONTROLSEX);
+    icex.dwICC = ICC_STANDARD_CLASSES;
+    InitCommonControlsEx(&icex);
+
+    // 加载图标 - 使用绝对路径
+    TCHAR szIconPath[MAX_PATH];
+    GetModuleFileName(NULL, szIconPath, MAX_PATH);
+    PathRemoveFileSpec(szIconPath);
+    PathAppend(szIconPath, _T("ico.ico"));
+    hIcon = (HICON)LoadImage(NULL, szIconPath, IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE);
+    if (!hIcon) {
+        hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    }
+
+    // 初始化应用程序
+    if (!InitApplication(hInstance))
+    {
+        return FALSE;
+    }
+
+    // 执行应用程序初始化
+    if (!InitInstance(hInstance, nCmdShow))
+    {
+        return FALSE;
+    }
+
+    // 主消息循环
+    printf("进入主消息循环...\n");
+    fflush(stdout);
+    
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0))
+    {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    printf("消息循环结束，程序即将退出\n");
+    fflush(stdout);
+    return (int)msg.wParam;
+}
+
+//
+// Purpose: 
+//  注册窗口类
+//
+BOOL InitApplication(HINSTANCE hInstance)
+{
+    printf("正在初始化应用程序...\n");
+    fflush(stdout);
+    
+    WNDCLASSEX wcex;
+
+    wcex.cbSize = sizeof(WNDCLASSEX);
+    wcex.style = CS_HREDRAW | CS_VREDRAW;
+    wcex.lpfnWndProc = WndProc;
+    wcex.cbClsExtra = 0;
+    wcex.cbWndExtra = 0;
+    wcex.hInstance = hInstance;
+    wcex.hIcon = hIcon;
+    wcex.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wcex.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wcex.lpszMenuName = NULL;
+    wcex.lpszClassName = WINDOW_TITLE;
+    wcex.hIconSm = hIcon;
+
+    // 注册字体
+    if (!RegisterClassEx(&wcex))
+        return FALSE;
+
+    return TRUE;
+}
+
+//
+// Purpose: 
+//  保存实例句柄并创建主窗口
+//
+BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
+{
+    // 创建字体
+    // 检查字体是否存在
+    LOGFONT lf;
+    ZeroMemory(&lf, sizeof(LOGFONT));
+    wcscpy_s(lf.lfFaceName, LF_FACESIZE, _T("Microsoft YaHei"));
+    lf.lfCharSet = GB2312_CHARSET;
+    lf.lfHeight = 16;
+    
+    // 检查字体是否存在
+    HDC hdc = GetDC(NULL);
+    if (hdc) {
+        if (!EnumFontFamiliesEx(hdc, &lf, NULL, 0, 0)) {
+            // 如果字体不存在，使用系统默认字体
+            wcscpy_s(lf.lfFaceName, LF_FACESIZE, _T("MS Shell Dlg"));
+        }
+        ReleaseDC(NULL, hdc);
+    }
+    
+    HFONT hFont = CreateFont(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        GB2312_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, lf.lfFaceName);
+
+    hMainWnd = CreateWindow(
+        WINDOW_TITLE, 
+        WINDOW_TITLE,
+        WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_THICKFRAME,
+        CW_USEDEFAULT, CW_USEDEFAULT, 300, 200,
+        NULL, NULL, hInstance, NULL);
+
+    if (!hMainWnd)
+    {
+        printf("窗口创建失败! 错误代码: %ld\n", GetLastError());
+        fflush(stdout);
+        DeleteObject(hFont);
+        return FALSE;
+    }
+    printf("主窗口创建成功\n");
+    fflush(stdout);
+
+    // 设置窗口字体
+    SendMessage(hMainWnd, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    // 创建控件
+    hCheckbox = CreateWindow(
+        _T("BUTTON"), 
+        _T("开机自启动"),
+        WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
+        20, 20, 200, 25,
+        hMainWnd, (HMENU)ID_CHECKBOX, hInstance, NULL);
+
+    // 设置复选框字体
+    SendMessage(hCheckbox, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    hApplyBtn = CreateWindow(
+        _T("BUTTON"), 
+        _T("应用设置"),
+        WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+        20, 60, 100, 30,
+        hMainWnd, (HMENU)ID_APPLY_BTN, hInstance, NULL);
+
+    // 设置按钮字体
+    SendMessage(hApplyBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    // 更新UI状态
+    UpdateUIState();
+
+    ShowWindow(hMainWnd, nCmdShow);
+    UpdateWindow(hMainWnd);
+
+    return TRUE;
+}
+
+//  主窗口过程
+// Purpose: 
+//  主窗口过程
+//
+LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    switch (message)
+    {
+    case WM_COMMAND:
+        {
+            int wmId = LOWORD(wParam);
+            switch (wmId)
+            {
+            case ID_CHECKBOX:
+                // 复选框状态改变
+                break;
+            case ID_APPLY_BTN:
+                // 应用设置
+                if (IsDlgButtonChecked(hWnd, ID_CHECKBOX) == BST_CHECKED)
+                {
+                    SvcInstall();
+                }
+                else
+                {
+                    SvcUninstall();
+                }
+                MessageBox(hWnd, _T("设置已应用"), _T("提示"), MB_OK | MB_ICONINFORMATION);
+                break;
+            }
+        }
+        break;
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        break;
+    default:
+        return DefWindowProc(hWnd, message, wParam, lParam);
+    }
+    return 0;
+}
+
+//
+// Purpose: 
+//  更新UI状态
+//
+void UpdateUIState()
+{
+    if (IsServiceInstalled())
+    {
+        SendMessage(hCheckbox, BM_SETCHECK, BST_CHECKED, 0);
+    }
+    else
+    {
+        SendMessage(hCheckbox, BM_SETCHECK, BST_UNCHECKED, 0);
+    }
+}
+
+//
+// Purpose: 
+//  检查服务是否已安装
+//
+BOOL IsServiceInstalled(void)
+{
+    SC_HANDLE schSCManager = OpenSCManager(NULL, NULL, SC_MANAGER_CONNECT);
+    if (schSCManager == NULL)
+    {
+        return FALSE;
+    }
+
+    SC_HANDLE schService = OpenService(schSCManager, SVCNAME, SERVICE_QUERY_STATUS);
+    if (schService == NULL)
+    {
+        CloseServiceHandle(schSCManager);
+        return FALSE;
+    }
+
+    CloseServiceHandle(schService);
+    CloseServiceHandle(schSCManager);
+    return TRUE;
+}
+
+//
+// Purpose: 
+//  卸载服务
+//
+VOID SvcUninstall()
+{
+    SC_HANDLE schSCManager;
+    SC_HANDLE schService;
+
+    // Get a handle to the SCM database
+    schSCManager = OpenSCManager(NULL, NULL, SC_MANAGER_ALL_ACCESS);
+    if (schSCManager == NULL)
+    {
+        return;
+    }
+
+    // Get a handle to the service
+    schService = OpenService(schSCManager, SVCNAME, DELETE);
+    if (schService == NULL)
+    {
+        CloseServiceHandle(schSCManager);
+        return;
+    }
+
+    // Delete the service
+    if (!DeleteService(schService))
+    {
+        CloseServiceHandle(schService);
+        CloseServiceHandle(schSCManager);
+        return;
+    }
+
+    CloseServiceHandle(schService);
+    CloseServiceHandle(schSCManager);
+}
+
+//
+// Purpose: 
+//  安装服务
+//
+VOID SvcInstall()
+{
+    SC_HANDLE schSCManager;
+    SC_HANDLE schService;
+    TCHAR szPath[MAX_PATH];
+
+    if (!GetModuleFileName(NULL, szPath, MAX_PATH))
+    {
+        return;
+    }
+
+    // 构建完整的命令行，添加/service参数
+    TCHAR szCmdPath[MAX_PATH + 20];
+    StringCchPrintf(szCmdPath, MAX_PATH + 20, _T("\"%s\" /service"), szPath);
+
+    // Get a handle to the SCM database
+    schSCManager = OpenSCManager(NULL, NULL, SC_MANAGER_ALL_ACCESS);
+    if (schSCManager == NULL)
+    {
+        return;
+    }
+
+    // Create the service
+    schService = CreateService(
+        schSCManager,              // SCM database
+        SVCNAME,                   // name of service
+        SVCNAME,                   // service name to display
+        SERVICE_ALL_ACCESS,        // desired access
+        SERVICE_WIN32_OWN_PROCESS, // service type
+        SERVICE_AUTO_START,        // start type
+        SERVICE_ERROR_NORMAL,      // error control type
+        szCmdPath,                 // path to service's binary with arguments
+        NULL,                      // no load ordering group
+        NULL,                      // no tag identifier
+        NULL,                      // no dependencies
+        NULL,                      // LocalSystem account
+        NULL);                     // no password
+
+    if (schService == NULL)
+    {
+        CloseServiceHandle(schSCManager);
+        return;
+    }
+
+    CloseServiceHandle(schService);
+    CloseServiceHandle(schSCManager);
+}
+
+//
+// Purpose: 
+//  服务控制处理函数
+//
+VOID WINAPI SvcCtrlHandler(DWORD dwCtrl)
+{
+    switch (dwCtrl)
+    {
+    case SERVICE_CONTROL_STOP:
+        ReportSvcStatus(SERVICE_STOP_PENDING, NO_ERROR, 0);
+        SetEvent(ghSvcStopEvent);
+        ReportSvcStatus(gSvcStatus.dwCurrentState, NO_ERROR, 0);
+        break;
+    default:
+        break;
+    }
+}
+
+//
+// Purpose: 
+//  报告服务状态
+//
+VOID ReportSvcStatus(DWORD dwCurrentState, DWORD dwWin32ExitCode, DWORD dwWaitHint)
+{
+    static DWORD dwCheckPoint = 1;
+
+    gSvcStatus.dwCurrentState = dwCurrentState;
+    gSvcStatus.dwWin32ExitCode = dwWin32ExitCode;
+    gSvcStatus.dwWaitHint = dwWaitHint;
+
+    if (dwCurrentState == SERVICE_START_PENDING)
+        gSvcStatus.dwControlsAccepted = 0;
+    else
+        gSvcStatus.dwControlsAccepted = SERVICE_ACCEPT_STOP;
+
+    if (dwCurrentState == SERVICE_RUNNING || dwCurrentState == SERVICE_STOPPED)
+        gSvcStatus.dwCheckPoint = 0;
+    else
+        gSvcStatus.dwCheckPoint = dwCheckPoint++;
+
+    SetServiceStatus(gSvcStatusHandle, &gSvcStatus);
+}
+
+//
+// Purpose: 
+//  服务初始化
+//
+VOID SvcInit(DWORD dwArgc, LPTSTR *lpszArgv)
+{
+    UNREFERENCED_PARAMETER(dwArgc);
+    UNREFERENCED_PARAMETER(lpszArgv);
+
+    ghSvcStopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (ghSvcStopEvent == NULL)
+    {
+        ReportSvcStatus(SERVICE_STOPPED, GetLastError(), 0);
+        return;
+    }
+
+    ReportSvcStatus(SERVICE_RUNNING, NO_ERROR, 0);
+
+    // 启动 AutoOpenLauncher.exe
+    STARTUPINFO si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    ZeroMemory(&pi, sizeof(pi));
+
+    if (!CreateProcess(
+        _T("D:\\VisualStudioCode\\C\\AutoOpen\\AutoOpenLauncher.exe"),
+        NULL, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi))
+    {
+        ReportSvcStatus(SERVICE_STOPPED, GetLastError(), 0);
+        return;
+    }
+
+    WaitForSingleObject(ghSvcStopEvent, INFINITE);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    ReportSvcStatus(SERVICE_STOPPED, NO_ERROR, 0);
+}
+
+//
+// Purpose: 
+//  服务主函数
+//
+VOID WINAPI SvcMain(DWORD dwArgc, LPTSTR *lpszArgv)
+{
+    gSvcStatusHandle = RegisterServiceCtrlHandler(SVCNAME, SvcCtrlHandler);
+    if (!gSvcStatusHandle)
+    {
+        ReportEvent(NULL, EVENTLOG_ERROR_TYPE, 0, 0, NULL, 1, 0,
+            (LPCWSTR[]){_T("RegisterServiceCtrlHandler failed")}, NULL);
+        return;
+    }
+
+    gSvcStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+    gSvcStatus.dwServiceSpecificExitCode = 0;
+    ReportSvcStatus(SERVICE_START_PENDING, NO_ERROR, 3000);
+
+    SvcInit(dwArgc, lpszArgv);
+}
