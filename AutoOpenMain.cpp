@@ -222,21 +222,65 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             PathCombineW(configPath, configDir, L"Config.ini");
 
             if (PathFileExistsW(configPath)) {
-                WCHAR filePath[MAX_PATH] = L"";
-                WCHAR openTime[64] = L"";
-                int savedAutoStart = 0;
-
-                GetPrivateProfileStringW(L"Settings", L"FilePath", L"", filePath, MAX_PATH, configPath);
-                GetPrivateProfileStringW(L"Settings", L"OpenTime", L"", openTime, 64, configPath);
-                savedAutoStart = GetPrivateProfileIntW(L"Settings", L"AutoStart", 0, configPath);
-
-                // 更新UI控件
-                SetDlgItemTextW(hWnd, 1008, filePath);
-                SetDlgItemTextW(hWnd, 1009, openTime);
-                if (savedAutoStart != autoStartEnabled) {
-                    autoStartEnabled = savedAutoStart;
-                    CheckDlgButton(hWnd, IDM_AUTOSTART, autoStartEnabled ? BST_CHECKED : BST_UNCHECKED);
-                    ToggleAutoStart(autoStartEnabled);
+                // 读取UTF-8格式的配置文件
+                HANDLE hFile = CreateFileW(configPath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+                if (hFile != INVALID_HANDLE_VALUE) {
+                    DWORD fileSize = GetFileSize(hFile, NULL);
+                    char* buffer = new char[fileSize + 1];
+                    DWORD bytesRead;
+                    if (ReadFile(hFile, buffer, fileSize, &bytesRead, NULL)) {
+                        buffer[bytesRead] = '\0';
+                        
+                        // 转换为宽字符
+                        int wideSize = MultiByteToWideChar(CP_UTF8, 0, buffer, -1, NULL, 0);
+                        WCHAR* wideBuffer = new WCHAR[wideSize];
+                        MultiByteToWideChar(CP_UTF8, 0, buffer, -1, wideBuffer, wideSize);
+                        
+                        // 解析配置文件内容
+                        WCHAR filePath[MAX_PATH] = L"";
+                        WCHAR openTime[64] = L"";
+                        int savedAutoStart = 0;
+                        
+                        // 简单解析INI格式
+                        WCHAR* section = wcsstr(wideBuffer, L"[Settings]");
+                        if (section) {
+                            WCHAR* fileKey = wcsstr(section, L"FilePath=");
+                            if (fileKey) {
+                                WCHAR* end = wcschr(fileKey + 9, L'\n');
+                                if (end) {
+                                    wcsncpy(filePath, fileKey + 9, end - (fileKey + 9));
+                                    filePath[end - (fileKey + 9)] = L'\0';
+                                }
+                            }
+                            
+                            WCHAR* timeKey = wcsstr(section, L"OpenTime=");
+                            if (timeKey) {
+                                WCHAR* end = wcschr(timeKey + 9, L'\n');
+                                if (end) {
+                                    wcsncpy(openTime, timeKey + 9, end - (timeKey + 9));
+                                    openTime[end - (timeKey + 9)] = L'\0';
+                                }
+                            }
+                            
+                            WCHAR* autoKey = wcsstr(section, L"AutoStart=");
+                            if (autoKey) {
+                                savedAutoStart = _wtoi(autoKey + 10);
+                            }
+                        }
+                        
+                        // 更新UI控件
+                        SetDlgItemTextW(hWnd, 1008, filePath);
+                        SetDlgItemTextW(hWnd, 1009, openTime);
+                        if (savedAutoStart != autoStartEnabled) {
+                            autoStartEnabled = savedAutoStart;
+                            CheckDlgButton(hWnd, IDM_AUTOSTART, autoStartEnabled ? BST_CHECKED : BST_UNCHECKED);
+                            ToggleAutoStart(autoStartEnabled);
+                        }
+                        
+                        delete[] wideBuffer;
+                    }
+                    delete[] buffer;
+                    CloseHandle(hFile);
                 }
             }
 
